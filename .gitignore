@@ -1,0 +1,14 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+
+# Editors and OS
+.DS_Store
+.idea/
+*.swp
+.cache/
+
+# Server data (visitor and solve counts)
+counters.txt
+counters.txt.tmp

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3x3 Rubik's Cube Solving - by Patty</title>
+  <meta name="description" content="A fast 3x3 Rubik's cube solver: Kociemba's two-phase algorithm in C++, with a 3D web demo.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="/" aria-label="3x3 Rubik's Cube Solving, home">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="1" y="1" width="10" height="10" rx="2.5" fill="#F4F4EC"/>
+        <rect x="13" y="1" width="10" height="10" rx="2.5" fill="#C8102E"/>
+        <rect x="1" y="13" width="10" height="10" rx="2.5" fill="#009B48"/>
+        <rect x="13" y="13" width="10" height="10" rx="2.5" fill="#FFD500"/>
+      </svg>
+      <span>3x3 Rubik's Cube Solving <span class="byline">- by Patty</span></span>
+    </a>
+    <p class="tagline">Kociemba's two-phase algorithm, written in C++. The small view shows the back.</p>
+    <div class="site-stats" aria-live="polite">
+      <span><strong id="count-visitors">-</strong> visitors</span>
+      <span><strong id="count-solved">-</strong> cubes solved by Patty's algorithm</span>
+    </div>
+  </header>
+
+  <main class="stage">
+    <section class="viewport" aria-label="Cube">
+      <div class="canvas-wrap">
+        <canvas id="cube" role="img" aria-label="3D view of the cube, from the front and from the back. Drag a sticker to turn its layer, or drag the background to turn the view."></canvas>
+        <canvas id="confetti" class="confetti" aria-hidden="true"></canvas>
+      </div>
+      <div class="practice">
+        <div><span class="label">Time</span><span id="timer" class="value">0:00.00</span></div>
+        <div><span class="label">Your moves</span><span id="move-count" class="value">0</span></div>
+        <div><span class="label">Your best</span><span id="best" class="value">-</span></div>
+      </div>
+      <p id="practice-note" class="practice-note">Scramble the cube, then solve it yourself. The timer starts on your first turn.</p>
+      <p class="hint">Drag a sticker to turn its layer. Drag the background to look around. Keys: <kbd>U</kbd> <kbd>R</kbd> <kbd>F</kbd> <kbd>D</kbd> <kbd>L</kbd> <kbd>B</kbd> turn a face, with <kbd>Shift</kbd> for counterclockwise. <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes. Arrow keys turn the view.</p>
+    </section>
+
+    <aside class="controls">
+      <div class="actions">
+        <button id="solve" class="primary" type="button">Solve</button>
+        <button id="scramble" type="button">Scramble</button>
+        <button id="reset" type="button">Reset</button>
+      </div>
+
+      <p class="settings">
+        <label>Stop at
+          <select id="target">
+            <option value="18">18</option>
+            <option value="19">19</option>
+            <option value="20" selected>20</option>
+            <option value="21">21</option>
+            <option value="22">22</option>
+          </select>
+          moves</label>
+        <label>or after
+          <select id="timeout">
+            <option value="300">0.3 s</option>
+            <option value="1000" selected>1 s</option>
+            <option value="3000">3 s</option>
+          </select></label>
+      </p>
+
+      <div id="status" class="status" role="status" aria-live="polite">Scramble the cube, or set up your own, then press Solve.</div>
+
+      <dl id="stats" class="stats" hidden>
+        <div><dt>Moves</dt><dd id="stat-moves"></dd></div>
+        <div><dt>Search time</dt><dd id="stat-time"></dd></div>
+        <div><dt>Positions checked</dt><dd id="stat-nodes"></dd></div>
+        <div><dt>Parallel searches</dt><dd id="stat-searches"></dd></div>
+      </dl>
+
+      <div class="pad-head">
+        <h2>Turn a face</h2>
+        <div class="history">
+          <button id="undo" type="button" title="Undo your last turn (Ctrl+Z)">Undo</button>
+          <button id="redo" type="button" title="Redo (Ctrl+Shift+Z)">Redo</button>
+        </div>
+      </div>
+      <div id="movepad" class="movepad"></div>
+
+      <h2>Set up your own cube</h2>
+      <form id="scramble-form" class="scramble-form">
+        <label class="visually-hidden" for="scramble-input">Scramble</label>
+        <input id="scramble-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a scramble, like R U R' U'">
+        <button type="submit">Apply</button>
+      </form>
+      <button id="edit" type="button" class="quiet">Paint the stickers of a real cube</button>
+    </aside>
+
+    <section class="tape-wrap" aria-labelledby="tape-title">
+      <div class="tape-head">
+        <h2 id="tape-title">Solution</h2>
+        <div class="transport">
+          <button id="first" type="button" title="Back to the scrambled cube">Start</button>
+          <button id="prev" type="button" title="Undo one move">Back</button>
+          <button id="play" type="button" class="play">Play</button>
+          <button id="next" type="button" title="Do the next move">Next</button>
+          <button id="last" type="button" title="Jump to the solved cube">End</button>
+          <label class="speed">Speed <input id="speed" type="range" min="1" max="5" value="3"></label>
+        </div>
+      </div>
+      <ol id="tape" class="tape" aria-live="off"></ol>
+      <p id="tape-empty" class="tape-empty">Press Solve to see the solution here. Then play it move by move.</p>
+    </section>
+  </main>
+
+
+  <dialog id="editor" class="editor" aria-labelledby="editor-title">
+    <form method="dialog" class="editor-body">
+      <h2 id="editor-title">Paint the stickers</h2>
+      <p class="editor-help">Hold your cube with white on top and green in front. Pick a color, then click stickers to paint them. Centers are fixed.</p>
+      <div id="palette" class="palette" role="radiogroup" aria-label="Paint color"></div>
+      <div id="net" class="net"></div>
+      <p id="editor-error" class="editor-error" role="alert"></p>
+      <div class="editor-actions">
+        <button id="editor-apply" type="button" class="primary">Use these stickers</button>
+        <button value="cancel" type="submit">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build (release)",
+      "type": "shell",
+      "command": "cmake --preset release && cmake --build --preset release -j",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Run tests",
+      "type": "shell",
+      "command": "ctest --preset release",
+      "dependsOn": "Build (release)",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Start web demo",
+      "type": "shell",
+      "command": "./build/cubesolver_server",
+      "dependsOn": "Build (release)",
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": { "regexp": "^__never_matches__$" },
+        "background": { "beginsPattern": "^Building solver tables", "endsPattern": "^Open http" }
+      }
+    },
+    {
+      "label": "Benchmark (200 cubes)",
+      "type": "shell",
+      "command": "./build/cubesolver bench --count 200",
+      "dependsOn": "Build (release)",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build (debug)",
+      "type": "shell",
+      "command": "cmake --preset debug && cmake --build --preset debug -j",
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

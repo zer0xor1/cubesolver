@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug: solve a scramble",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/cubesolver",
+      "args": ["solve", "R U F' D2 L B' R2 U' F D L2 B", "--threads", "1"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build (debug)"
+    },
+    {
+      "name": "Debug: unit tests",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/cubesolver_tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build (debug)"
+    },
+    {
+      "name": "Debug: web server",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/cubesolver_server",
+      "args": ["--port", "8080"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build (debug)"
+    }
+  ]
+}
