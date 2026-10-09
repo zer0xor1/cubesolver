@@ -4,7 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>3x3 Rubik's Cube Solving - by Patty</title>
-  <meta name="description" content="A fast 3x3 Rubik's cube solver: Kociemba's two-phase algorithm in C++, with a 3D web demo.">
+  <meta name="description" content="Scramble a 3D Rubik's cube, solve it yourself against the clock, or watch a C++ solver finish it in about 20 moves.">
+  <meta name="theme-color" content="#262c45">
+  <!-- Link previews. The server replaces __SITE_ORIGIN__ with the site's address. -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="3x3 Rubik's Cube Solving">
+  <meta property="og:title" content="3x3 Rubik's Cube Solving - by Patty">
+  <meta property="og:description" content="Scramble a 3D Rubik's cube, solve it yourself against the clock, or watch a C++ solver finish it in about 20 moves.">
+  <meta property="og:url" content="__SITE_ORIGIN__/">
+  <meta property="og:image" content="__SITE_ORIGIN__/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="A scrambled Rubik's cube next to the title 3x3 Rubik's Cube Solving, by Patty">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="3x3 Rubik's Cube Solving - by Patty">
+  <meta name="twitter:description" content="Scramble a 3D Rubik's cube, solve it yourself against the clock, or watch a C++ solver finish it in about 20 moves.">
+  <meta name="twitter:image" content="__SITE_ORIGIN__/og-image.png">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -28,6 +43,11 @@
       <span><strong id="count-solved">-</strong> cubes solved by Patty's algorithm</span>
     </div>
   </header>
+
+  <div id="waking" class="waking" role="status" hidden>
+    <span class="spinner" aria-hidden="true"></span>
+    <span>Waking up the server (<span id="waking-seconds">0</span> s). Free hosting puts it to sleep when nobody visits, so this can take up to a minute.</span>
+  </div>
 
   <main class="stage">
     <section class="viewport" aria-label="Cube">
@@ -94,6 +114,7 @@
         <button type="submit">Apply</button>
       </form>
       <button id="edit" type="button" class="quiet">Paint the stickers of a real cube</button>
+      <button id="share" type="button" class="quiet">Copy a link to this cube</button>
     </aside>
 
     <section class="tape-wrap" aria-labelledby="tape-title">

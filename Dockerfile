@@ -5,10 +5,12 @@
 #
 # Hosting services set PORT themselves. The visitor and solve counts are saved
 # in /data; mount a volume there to keep them across restarts and deploys.
+# On a host without a disk, set UPSTASH_REDIS_REST_URL and
+# UPSTASH_REDIS_REST_TOKEN instead.
 
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends g++ cmake make \
+ && apt-get install -y --no-install-recommends g++ cmake make libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY CMakeLists.txt ./
@@ -20,6 +22,10 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCUBESOLVER_BUILD_TESTS=OFF 
  && cmake --build build -j --target cubesolver_server
 
 FROM debian:bookworm-slim
+# libssl3 and the CA certificates let the server reach Upstash over HTTPS.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /src/build/cubesolver_server /app/cubesolver_server
 COPY web /app/web

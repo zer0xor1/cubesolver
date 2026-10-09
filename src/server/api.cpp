@@ -4,8 +4,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #include "cubesolver/cubie.hpp"
 #include "cubesolver/facelet.hpp"
@@ -105,9 +108,12 @@ Service::SolveSlot::~SolveSlot() {
     s_.slotFree_.notify_one();
 }
 
-Service::Service(size_t cacheCapacity, int maxConcurrentSolves, int slotWaitMs, const std::string& countersFile)
+Service::Service(size_t cacheCapacity, int maxConcurrentSolves, int slotWaitMs,
+                 std::unique_ptr<CounterStore> counterStore, const RateLimits& limits)
     : cache_(cacheCapacity),
-      counters_(countersFile),
+      counters_(std::move(counterStore)),
+      solveLimiter_(limits.solvesPerMinute / 60.0, limits.solveBurst),
+      visitLimiter_(limits.visitsPerHour / 3600.0, limits.visitBurst),
       maxConcurrent_(std::max(1, maxConcurrentSolves)),
       slotWaitMs_(std::max(0, slotWaitMs)),
       rng_(std::random_device{}()),
@@ -206,7 +212,8 @@ Response Service::stats() const {
                      ",\"cacheHits\":" + std::to_string(cacheHits_.load()) + ",\"cacheEntries\":" +
                      std::to_string(cache_.size()) + ",\"badRequests\":" + std::to_string(badRequests_.load()) +
                      ",\"scrambles\":" + std::to_string(scrambles_.load()) + ",\"averageSolveMs\":" + number(avgMs, 2) +
-                     ",\"maxConcurrentSolves\":" + std::to_string(maxConcurrent_) + "}"};
+                     ",\"maxConcurrentSolves\":" + std::to_string(maxConcurrent_) +
+                     ",\"rateLimited\":" + std::to_string(rateLimited_.load()) + "}"};
 }
 
 Response Service::visit() {
@@ -216,6 +223,40 @@ Response Service::visit() {
 
 Response Service::counters() const {
     return {200, counters_.json()};
+}
+
+int Service::checkLimit(Limit which, const std::string& client) {
+    const int wait = (which == Limit::Solve ? solveLimiter_ : visitLimiter_).check(client);
+    if (wait > 0) ++rateLimited_;
+    return wait;
+}
+
+std::string clientKey(const std::string& forwardedFor, const std::string& remoteAddr) {
+    if (forwardedFor.empty()) return remoteAddr;
+    std::string first = forwardedFor.substr(0, forwardedFor.find(','));
+    const auto notSpace = [](char ch) { return ch != ' ' && ch != '\t'; };
+    first.erase(first.begin(), std::find_if(first.begin(), first.end(), notSpace));
+    first.erase(std::find_if(first.rbegin(), first.rend(), notSpace).base(), first.end());
+    return first.empty() ? remoteAddr : first;
+}
+
+std::string siteOrigin(const std::string& host, const std::string& forwardedProto) {
+    if (host.empty() || host.size() > 253) return "";
+    for (const char ch : host) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' ||
+                        ch == '-' || ch == ':' || ch == '[' || ch == ']';
+        if (!ok) return "";
+    }
+    const std::string proto = forwardedProto.substr(0, forwardedProto.find(','));
+    return (proto == "https" ? "https://" : "http://") + host;
+}
+
+std::string fillPageTemplate(std::string page, const std::string& origin) {
+    const std::string marker = "__SITE_ORIGIN__";
+    for (size_t pos = page.find(marker); pos != std::string::npos; pos = page.find(marker, pos + origin.size())) {
+        page.replace(pos, marker.size(), origin);
+    }
+    return page;
 }
 
 void configureServer(httplib::Server& server) {
@@ -244,23 +285,41 @@ void registerRoutes(httplib::Server& server, Service& service, const std::string
         if (!req.has_param(name)) return std::nullopt;
         return req.get_param_value(name);
     };
+    auto client = [](const httplib::Request& req) {
+        return clientKey(req.get_header_value("X-Forwarded-For"), req.remote_addr);
+    };
+    // Answers 429 and returns true if the client is over the solve limit.
+    auto overSolveLimit = [&service, send, client](const httplib::Request& req, httplib::Response& res) {
+        const int wait = service.checkLimit(Limit::Solve, client(req));
+        if (wait == 0) return false;
+        send(res, {429, errorJson("too many requests, try again in " + std::to_string(wait) + " seconds")});
+        res.set_header("Retry-After", std::to_string(wait));
+        return true;
+    };
 
     server.Get("/api/health",
                [&service, send](const httplib::Request&, httplib::Response& res) { send(res, service.health()); });
-    server.Get("/api/solve", [&service, send, param](const httplib::Request& req, httplib::Response& res) {
-        SolveRequest r;
-        r.facelets = param(req, "facelets");
-        r.scramble = param(req, "scramble");
-        r.target = param(req, "target");
-        r.timeout = param(req, "timeout");
-        send(res, service.solve(r));
+    server.Get("/api/solve",
+               [&service, send, param, overSolveLimit](const httplib::Request& req, httplib::Response& res) {
+                   if (overSolveLimit(req, res)) return;
+                   SolveRequest r;
+                   r.facelets = param(req, "facelets");
+                   r.scramble = param(req, "scramble");
+                   r.target = param(req, "target");
+                   r.timeout = param(req, "timeout");
+                   send(res, service.solve(r));
+               });
+    server.Get("/api/scramble", [&service, send, overSolveLimit](const httplib::Request& req, httplib::Response& res) {
+        if (overSolveLimit(req, res)) return;
+        send(res, service.scramble());
     });
-    server.Get("/api/scramble",
-               [&service, send](const httplib::Request&, httplib::Response& res) { send(res, service.scramble()); });
     server.Get("/api/stats",
                [&service, send](const httplib::Request&, httplib::Response& res) { send(res, service.stats()); });
-    server.Post("/api/visit",
-                [&service, send](const httplib::Request&, httplib::Response& res) { send(res, service.visit()); });
+    server.Post("/api/visit", [&service, send, client](const httplib::Request& req, httplib::Response& res) {
+        // Over the limit: answer normally, just don't count the visit.
+        const bool count = service.checkLimit(Limit::Visit, client(req)) == 0;
+        send(res, count ? service.visit() : service.counters());
+    });
     server.Get("/api/counters",
                [&service, send](const httplib::Request&, httplib::Response& res) { send(res, service.counters()); });
 
@@ -281,7 +340,24 @@ void registerRoutes(httplib::Server& server, Service& service, const std::string
         send(res, {500, errorJson(message)});
     });
 
-    if (!webDir.empty()) server.set_mount_point("/", webDir);
+    if (webDir.empty()) return;
+    // The page itself goes through fillPageTemplate. This runs before the
+    // static files, which would otherwise serve index.html as it is.
+    const std::string indexPath = webDir + "/index.html";
+    server.set_pre_routing_handler([indexPath](const httplib::Request& req, httplib::Response& res) {
+        if ((req.method != "GET" && req.method != "HEAD") || (req.path != "/" && req.path != "/index.html")) {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }
+        std::ifstream in(indexPath, std::ios::binary);
+        if (!in) return httplib::Server::HandlerResponse::Unhandled;
+        std::ostringstream page;
+        page << in.rdbuf();
+        const std::string origin = siteOrigin(req.get_header_value("Host"), req.get_header_value("X-Forwarded-Proto"));
+        res.set_header("Cache-Control", "no-cache");
+        res.set_content(fillPageTemplate(page.str(), origin), "text/html; charset=utf-8");
+        return httplib::Server::HandlerResponse::Handled;
+    });
+    server.set_mount_point("/", webDir);
 }
 
 }  // namespace cube::server

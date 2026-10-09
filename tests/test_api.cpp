@@ -1,5 +1,10 @@
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 
@@ -51,16 +56,138 @@ TEST_CASE("site counters count visitors and solves, and survive a restart") {
     const std::filesystem::path file = std::filesystem::temp_directory_path() / "cubesolver_test_counters.txt";
     std::filesystem::remove(file);
     {
-        SiteCounters counters(file.string());
+        SiteCounters counters(std::make_unique<FileStore>(file.string()));
         CHECK(counters.json() == "{\"visitors\":0,\"cubesSolved\":0}");
         counters.addVisitor();
         counters.addVisitor();
         counters.addSolve();
-    }
-    SiteCounters reloaded(file.string());
-    CHECK(reloaded.visitors() == 2);
-    CHECK(reloaded.cubesSolved() == 1);
+        CHECK(counters.json() == "{\"visitors\":2,\"cubesSolved\":1}");  // before any save
+    }  // the destructor saves
+    SiteCounters reloaded(std::make_unique<FileStore>(file.string()));
+    CHECK(reloaded.counts().visitors == 2);
+    CHECK(reloaded.counts().cubesSolved == 1);
     std::filesystem::remove(file);
+}
+
+// A stand-in for Upstash's /pipeline endpoint: understands two INCRBY commands.
+struct FakeUpstash {
+    httplib::Server server;
+    std::thread thread;
+    int port = 0;
+    std::mutex mutex;
+    std::map<std::string, long long> values;
+    bool fail = false;
+
+    FakeUpstash() {
+        server.Post("/pipeline", [this](const httplib::Request& req, httplib::Response& res) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (fail || req.get_header_value("Authorization") != "Bearer secret") {
+                res.status = 401;
+                res.set_content("{\"error\":\"Unauthorized\"}", "application/json");
+                return;
+            }
+            const std::regex command(R"re(\["INCRBY","([^"]+)","(\d+)"\])re");
+            std::string reply = "[";
+            for (std::sregex_iterator it(req.body.begin(), req.body.end(), command), endIt; it != endIt; ++it) {
+                const long long v = values[(*it)[1]] += std::stoll((*it)[2]);
+                reply += std::string(reply.size() > 1 ? "," : "") + "{\"result\":" + std::to_string(v) + "}";
+            }
+            res.set_content(reply + "]", "application/json");
+        });
+        port = server.bind_to_any_port("127.0.0.1");
+        thread = std::thread([this] { server.listen_after_bind(); });
+        server.wait_until_ready();
+    }
+    ~FakeUpstash() {
+        server.stop();
+        thread.join();
+    }
+    std::string url() const { return "http://127.0.0.1:" + std::to_string(port); }
+};
+
+TEST_CASE("counts saved to Upstash survive a restart") {
+    FakeUpstash upstash;
+    {
+        SiteCounters counters(std::make_unique<UpstashStore>(upstash.url(), "secret"));
+        counters.addVisitor();
+        counters.addSolve();
+        counters.addSolve();
+        CHECK(counters.flush());
+        counters.addVisitor();
+    }  // the destructor sends the last visitor
+    CHECK(upstash.values["cubesolver:visitors"] == 2);
+    CHECK(upstash.values["cubesolver:cubesSolved"] == 2);
+
+    SiteCounters reloaded(std::make_unique<UpstashStore>(upstash.url() + "/", "secret"));
+    CHECK(reloaded.json() == "{\"visitors\":2,\"cubesSolved\":2}");
+}
+
+TEST_CASE("counts are kept when Upstash fails, and sent once it works again") {
+    FakeUpstash upstash;
+    SiteCounters counters(std::make_unique<UpstashStore>(upstash.url(), "secret"));
+    {
+        std::lock_guard<std::mutex> lock(upstash.mutex);
+        upstash.fail = true;
+    }
+    counters.addVisitor();
+    CHECK_FALSE(counters.flush());
+    CHECK(counters.counts().visitors == 1);  // still shown
+    {
+        std::lock_guard<std::mutex> lock(upstash.mutex);
+        upstash.fail = false;
+    }
+    CHECK(counters.flush());
+    std::lock_guard<std::mutex> lock(upstash.mutex);
+    CHECK(upstash.values["cubesolver:visitors"] == 1);
+}
+
+TEST_CASE("Upstash with a wrong token does not crash the server") {
+    FakeUpstash upstash;
+    SiteCounters counters(std::make_unique<UpstashStore>(upstash.url(), "wrong"));
+    counters.addSolve();
+    CHECK_FALSE(counters.flush());
+    CHECK(counters.counts().cubesSolved == 1);
+}
+
+TEST_CASE("rate limiter allows a burst, then a steady rate") {
+    using namespace std::chrono_literals;
+    RateLimiter limiter(/*perSecond=*/0.5, /*burst=*/2);
+    const auto t0 = RateLimiter::Clock::now();
+    CHECK(limiter.check("a", t0) == 0);
+    CHECK(limiter.check("a", t0) == 0);
+    CHECK(limiter.check("a", t0) == 2);         // empty: one request needs 2 s
+    CHECK(limiter.check("b", t0) == 0);         // other clients are not affected
+    CHECK(limiter.check("a", t0 + 1s) == 1);    // half a request saved up
+    CHECK(limiter.check("a", t0 + 2s) == 0);    // one full request
+    CHECK(limiter.check("a", t0 + 100s) == 0);  // refills only up to the burst
+    CHECK(limiter.check("a", t0 + 100s) == 0);
+    CHECK(limiter.check("a", t0 + 100s) == 2);
+}
+
+TEST_CASE("rate limiter forgets idle clients when it is full") {
+    using namespace std::chrono_literals;
+    RateLimiter limiter(1, 1, /*maxClients=*/2);
+    const auto t0 = RateLimiter::Clock::now();
+    CHECK(limiter.check("a", t0) == 0);
+    CHECK(limiter.check("b", t0) == 0);
+    CHECK(limiter.check("c", t0 + 5s) == 0);  // a and b refilled and were forgotten
+    CHECK(limiter.check("c", t0 + 5s) == 1);
+}
+
+TEST_CASE("client address, site origin and page template") {
+    CHECK(clientKey("", "10.0.0.1") == "10.0.0.1");
+    CHECK(clientKey("203.0.113.7, 10.0.0.2", "10.0.0.1") == "203.0.113.7");
+    CHECK(clientKey("  198.51.100.4 ", "10.0.0.1") == "198.51.100.4");
+
+    CHECK(siteOrigin("cube.onrender.com", "https") == "https://cube.onrender.com");
+    CHECK(siteOrigin("localhost:8080", "") == "http://localhost:8080");
+    CHECK(siteOrigin("a.com", "https,http") == "https://a.com");
+    CHECK(siteOrigin("evil.com\"><script>", "https").empty());  // never put markup in the page
+    CHECK(siteOrigin("", "https").empty());
+
+    CHECK(fillPageTemplate("<a href=\"__SITE_ORIGIN__/\">__SITE_ORIGIN__</a>", "https://x.io") ==
+          "<a href=\"https://x.io/\">https://x.io</a>");
+    CHECK(fillPageTemplate("no marker", "https://x.io") == "no marker");
 }
 
 TEST_CASE("a cube counts as solved only when the solver solved something") {
@@ -177,4 +304,57 @@ TEST_CASE("HTTP server end to end") {
 
     server.stop();
     listener.join();
+}
+
+TEST_CASE("HTTP rate limits and the filled-in page") {
+    const std::filesystem::path web = std::filesystem::temp_directory_path() / "cubesolver_test_web";
+    std::filesystem::create_directories(web);
+    std::ofstream(web / "index.html") << "<meta property=\"og:image\" content=\"__SITE_ORIGIN__/og.png\">";
+
+    httplib::Server server;
+    RateLimits limits;
+    limits.solvesPerMinute = 1;
+    limits.solveBurst = 2;
+    limits.visitsPerHour = 1;
+    limits.visitBurst = 1;
+    Service service(16, 4, 5000, nullptr, limits);
+    configureServer(server);
+    registerRoutes(server, service, web.string());
+    const int port = server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread listener([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(10, 0);
+
+    // Two solves pass, the third is limited. Another client is not affected.
+    const httplib::Headers alice = {{"X-Forwarded-For", "203.0.113.1"}};
+    const httplib::Headers bob = {{"X-Forwarded-For", "203.0.113.2"}};
+    CHECK(client.Get("/api/solve?scramble=R", alice)->status == 200);
+    CHECK(client.Get("/api/scramble", alice)->status == 200);
+    auto limited = client.Get("/api/solve?scramble=R", alice);
+    REQUIRE(limited);
+    CHECK(limited->status == 429);
+    CHECK(limited->get_header_value("Retry-After") == "60");
+    CHECK(limited->body.find("too many requests") != std::string::npos);
+    CHECK(client.Get("/api/solve?scramble=R", bob)->status == 200);
+
+    // The second visit from the same address is answered but not counted.
+    CHECK(client.Post("/api/visit", alice, "", "text/plain")->body.find("\"visitors\":1") != std::string::npos);
+    auto again = client.Post("/api/visit", alice, "", "text/plain");
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(again->body.find("\"visitors\":1") != std::string::npos);
+
+    // The page gets the site's address filled in.
+    const httplib::Headers site = {{"Host", "cube.example.com"}, {"X-Forwarded-Proto", "https"}};
+    auto page = client.Get("/", site);
+    REQUIRE(page);
+    CHECK(page->status == 200);
+    CHECK(page->body == "<meta property=\"og:image\" content=\"https://cube.example.com/og.png\">");
+    CHECK(page->get_header_value("Content-Type") == "text/html; charset=utf-8");
+
+    server.stop();
+    listener.join();
+    std::filesystem::remove_all(web);
 }

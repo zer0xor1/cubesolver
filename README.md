@@ -85,7 +85,7 @@ Useful options: `--target N` (good-enough length, default 20), `--timeout MS` (d
 
 ## HTTP API
 
-Start the server with `./build/cubesolver_server` (options: `--port`, `--host`, `--web-dir`, `--data-file`). The `PORT` and `CUBESOLVER_DATA_FILE` environment variables work too.
+Start the server with `./build/cubesolver_server` (options: `--port`, `--host`, `--web-dir`, `--data-file`). The `PORT` and `CUBESOLVER_DATA_FILE` environment variables work too, and `UPSTASH_REDIS_REST_URL` with `UPSTASH_REDIS_REST_TOKEN` saves the counts to Upstash (see below). Upstash needs HTTPS, so the build uses OpenSSL 3 when it finds it (`brew install openssl@3` on macOS, `libssl-dev` on Linux).
 
 | Request | Returns |
 |---|---|
@@ -109,6 +109,8 @@ curl "http://localhost:8080/api/solve?scramble=R%20U%20R'%20U'"
 
 Bad input gets status 400 and a message, for example `{"error":"color R appears 10 times, expected 9"}`. If all four solve slots stay busy for 5 seconds, the server answers 503 instead of making requests wait forever.
 
+Each address may make 15 solves or scrambles at once, then 30 a minute. Past that, the server answers 429 with a `Retry-After` header. Visits are limited the same way (5 at once, then 10 an hour); extra visits are answered but not counted. Behind a hosting proxy, the address comes from `X-Forwarded-For`. A client can fake that header, so the limit stops accidents and casual abuse, not a determined attacker.
+
 The sticker string lists the faces in the order U, R, F, D, L, B, nine stickers each, read row by row. Each letter names the face whose center has that color. See [include/cubesolver/facelet.hpp](include/cubesolver/facelet.hpp) for the exact layout.
 
 ## Put it on the internet
@@ -120,9 +122,22 @@ docker build -t cubesolver .
 docker run -p 8080:8080 -v cubesolver-data:/data cubesolver   # then open http://localhost:8080
 ```
 
-**Render (free):** push the project to GitHub. On render.com, choose **New > Web Service**, pick the repository, and pick **Docker**. Render finds the Dockerfile and sets `PORT`. The free plan has no disk, so the visitor and solve counts start again from zero after each deploy or restart. A paid disk mounted at `/data` keeps them.
+**Render (free):** push the project to GitHub. On render.com, choose **New > Web Service**, pick the repository, pick **Docker**, and set the health check path to `/api/health`. Render finds the Dockerfile and sets `PORT`.
+
+**Keep the counts on Render's free plan.** The free plan has no disk, so counts saved to a file are lost on every deploy. Save them in a free Upstash Redis database instead:
+
+1. Sign up at upstash.com and create a **Redis** database (the free plan is enough; pick the region closest to your Render region).
+2. On the database page, find the **REST API** section. Copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+3. In Render, open your service, then **Environment**, and add both as environment variables with those exact names.
+4. Save. Render deploys again. The log should say `Saving visitor and solve counts to Upstash Redis at https://...`.
+
+The server keeps the counts in memory and sends changes to Upstash at most every 15 seconds, and once more when it stops. That stays well inside the free plan's limits.
+
+**Keep the free server awake (optional).** Render stops a free server after 15 minutes without visitors. The next visitor then waits about a minute; the page shows a "Waking up the server" message while it waits. To avoid the wait, have a free monitor such as UptimeRobot open `https://<your-site>/api/health` every 5 minutes. One always-on free service fits in Render's 750 free hours a month.
 
 **Fly.io:** run `fly launch` in the project folder, then `fly volumes create data --size 1` and mount it at `/data` in `fly.toml` (`[mounts] source = "data"`, `destination = "/data"`). The counts then survive restarts.
+
+**Sharing.** The address bar always holds the current cube (`#scramble=R+U+F2` or `#cube=<54 letters>`), and **Copy a link to this cube** copies it. Shared links show a preview card (title, text and `web/og-image.png`) in chat apps and social sites; the server fills in the site's address in the page, because previews need a full image URL.
 
 The visitor count counts each browser once. Someone who clears their browser data counts again.
 

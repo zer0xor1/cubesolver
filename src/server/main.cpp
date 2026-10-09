@@ -5,10 +5,26 @@
 // Hosting services pass the port in the PORT environment variable; it is used
 // when --port is not given. CUBESOLVER_DATA_FILE works the same way for
 // --data-file, the file that keeps the visitor and solve counts.
+//
+// To keep the counts on a host without a disk, set UPSTASH_REDIS_REST_URL and
+// UPSTASH_REDIS_REST_TOKEN (from a free Upstash Redis database). They win over
+// --data-file.
+//
+// SIGTERM and SIGINT (Ctrl+C) stop the server cleanly, so the last counts are
+// saved before it exits. Hosting services send SIGTERM before a deploy.
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
+
+#ifndef _WIN32
+#include <pthread.h>
+
+#include <csignal>
+#endif
 
 #include "api.hpp"
 #include "cubesolver/tables.hpp"
@@ -38,9 +54,38 @@ std::string findWebDir(const char* argv0, const std::string& override) {
     return "";
 }
 
+// Picks where the visitor and solve counts are kept.
+std::unique_ptr<cube::server::CounterStore> makeCounterStore(const std::string& dataFile) {
+    const char* url = std::getenv("UPSTASH_REDIS_REST_URL");
+    const char* token = std::getenv("UPSTASH_REDIS_REST_TOKEN");
+    if (url && *url) {
+        if (!token || !*token) {
+            std::fprintf(stderr, "UPSTASH_REDIS_REST_URL is set but UPSTASH_REDIS_REST_TOKEN is not\n");
+            return nullptr;
+        }
+        try {
+            return std::make_unique<cube::server::UpstashStore>(url, token);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "Cannot use Upstash: %s\n", e.what());
+            return nullptr;
+        }
+    }
+    if (!dataFile.empty()) return std::make_unique<cube::server::FileStore>(dataFile);
+    return nullptr;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    // Block SIGTERM and SIGINT in every thread; one thread waits for them below.
+    sigset_t stopSignals;
+    sigemptyset(&stopSignals);
+    sigaddset(&stopSignals, SIGTERM);
+    sigaddset(&stopSignals, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &stopSignals, nullptr);
+#endif
+
     const char* envPort = std::getenv("PORT");
     const char* envDataFile = std::getenv("CUBESOLVER_DATA_FILE");
     int port = envPort ? std::atoi(envPort) : 8080;
@@ -57,7 +102,8 @@ int main(int argc, char** argv) {
             if (arg == "--data-file") dataFile = value;
         } else if (arg == "-h" || arg == "--help") {
             std::printf(
-                "Usage: cubesolver_server [--port 8080] [--host 127.0.0.1] [--web-dir path] [--data-file path]\n");
+                "Usage: cubesolver_server [--port 8080] [--host 127.0.0.1] [--web-dir path] [--data-file path]\n"
+                "Environment: PORT, CUBESOLVER_DATA_FILE, UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s (try --help)\n", arg.c_str());
@@ -81,12 +127,13 @@ int main(int argc, char** argv) {
     }
 
     httplib::Server server;
-    cube::server::Service service(2048, 4, 5000, dataFile);
-    if (dataFile.empty()) {
-        std::printf("Visitor and solve counts are kept in memory only (use --data-file to save them).\n");
+    auto store = makeCounterStore(dataFile);
+    if (store) {
+        std::printf("Saving visitor and solve counts to %s\n", store->describe().c_str());
     } else {
-        std::printf("Saving visitor and solve counts to %s\n", dataFile.c_str());
+        std::printf("Visitor and solve counts are kept in memory only (see --help to keep them).\n");
     }
+    cube::server::Service service(2048, 4, 5000, std::move(store));
     cube::server::configureServer(server);
     cube::server::registerRoutes(server, service, webDir);
 
@@ -95,7 +142,18 @@ int main(int argc, char** argv) {
                      host.c_str(), port, port + 1);
         return 1;
     }
+#ifndef _WIN32
+    std::thread([&server, stopSignals] {
+        int sig = 0;
+        sigwait(&stopSignals, &sig);
+        std::printf("\nStopping...\n");
+        std::fflush(stdout);
+        server.stop();
+    }).detach();
+#endif
+
     std::printf("\nOpen http://localhost:%d in your browser (Ctrl+C to stop)\n", port);
     std::fflush(stdout);
-    return server.listen_after_bind() ? 0 : 1;
+    const bool ok = server.listen_after_bind();
+    return ok ? 0 : 1;  // ~Service saves the last counts
 }

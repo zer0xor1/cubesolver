@@ -21,6 +21,7 @@ const state = {
 function setStickers(stickers) {
   state.stickers = stickers;
   renderer.setStickers(stickers);
+  scheduleHashSync();
 }
 
 function facelets() {
@@ -38,16 +39,75 @@ function setStatus(text, isError = false) {
   el.classList.toggle("error", isError);
 }
 
-async function api(path, options) {
+const UNREACHABLE =
+  "Can't reach the solver server. Try again in a minute. If you run it yourself, start ./build/cubesolver_server and open http://localhost:8080.";
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ----------------------------------------------------------------- waiting for the server
+// Free hosting stops the server when nobody visits. The first request then
+// waits (or fails) until it starts again, so every request first waits for
+// /api/health, and a banner explains the wait if it takes more than a moment.
+let serverReady = null;
+let wakingTimer = 0;
+
+function waitForServer() {
+  if (!serverReady) {
+    serverReady = pingUntilUp().catch((e) => {
+      serverReady = null; // try again next time
+      throw e;
+    });
+  }
+  return serverReady;
+}
+
+async function pingUntilUp() {
+  const started = performance.now();
+  const showSoon = setTimeout(() => showWaking(started), 2500);
+  try {
+    while (performance.now() - started < 150000) {
+      try {
+        const res = await fetch("/api/health", { cache: "no-store" });
+        if (res.ok) return;
+      } catch {
+        // not up yet
+      }
+      showWaking(started);
+      await sleep(3000);
+    }
+    throw new Error(UNREACHABLE);
+  } finally {
+    clearTimeout(showSoon);
+    $("waking").hidden = true;
+    clearInterval(wakingTimer);
+    wakingTimer = 0;
+  }
+}
+
+function showWaking(started) {
+  $("waking").hidden = false;
+  if (wakingTimer) return;
+  const tick = () => ($("waking-seconds").textContent = String(Math.round((performance.now() - started) / 1000)));
+  tick();
+  wakingTimer = setInterval(tick, 1000);
+}
+
+async function api(path, options, retried = false) {
+  await waitForServer();
   let res;
   try {
     res = await fetch(path, options);
   } catch {
-    throw new Error(
-      "Can't reach the solver server. If you run it yourself, start ./build/cubesolver_server and open http://localhost:8080.",
-    );
+    if (retried) throw new Error(UNREACHABLE);
+    serverReady = null; // it went away: wait for it, then try once more
+    return api(path, options, true);
   }
-  const body = await res.json().catch(() => ({}));
+  const isJson = (res.headers.get("Content-Type") || "").includes("application/json");
+  // A 502-504 that is not our JSON comes from the host's proxy while the server restarts.
+  if (!isJson && res.status >= 502 && res.status <= 504 && !retried) {
+    serverReady = null;
+    return api(path, options, true);
+  }
+  const body = isJson ? await res.json().catch(() => ({})) : {};
   if (!res.ok) throw new Error(body.error ? `${capitalize(body.error)}.` : `Server error ${res.status}.`);
   return body;
 }
@@ -301,6 +361,82 @@ async function loadCounters() {
   }
 }
 
+// ----------------------------------------------------------------- share links
+// The address holds the cube: #scramble=R+U+F2 when the cube came from a
+// scramble, or #cube=<54 letters> after your own turns or painting.
+let lastScramble = null; // { text, facelets }
+let hashTimer = 0;
+
+function shareUrl() {
+  const base = location.origin + location.pathname;
+  const f = facelets();
+  if (f === Cube.SOLVED) return base;
+  if (lastScramble && lastScramble.facelets === f) return `${base}#${new URLSearchParams({ scramble: lastScramble.text })}`;
+  return `${base}#cube=${f}`;
+}
+
+// Keeps the address bar in step with the cube, but not on every animation
+// frame (browsers limit how often the address may change).
+function scheduleHashSync() {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    try {
+      history.replaceState(null, "", shareUrl());
+    } catch {
+      // some embedded browsers forbid it; the copy button still works
+    }
+  }, 400);
+}
+
+function validFacelets(f) {
+  if (!/^[URFDLB]{54}$/.test(f)) return false;
+  if ([...Cube.FACES].some((c) => f.split(c).length - 1 !== 9)) return false;
+  return [...Cube.FACES].every((c, i) => f[i * 9 + 4] === c); // centers in place
+}
+
+function loadFromHash() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const scrambleText = params.get("scramble");
+  const cube = params.get("cube");
+  if (scrambleText) {
+    $("scramble-input").value = scrambleText;
+    applyScramble(scrambleText, "Loaded the cube from the link. Solve it yourself, or press Solve.");
+  } else if (cube) {
+    if (state.busy) return;
+    if (!validFacelets(cube)) {
+      setStatus("The cube in this link is not valid, so it was skipped.", true);
+      return;
+    }
+    clearSolution();
+    clearHistory();
+    lastScramble = null;
+    setStickers(Cube.fromFacelets(cube));
+    armPractice();
+    updateControls();
+    setStatus("Loaded the cube from the link. Solve it yourself, or press Solve.");
+  }
+}
+
+async function copyLink() {
+  const url = shareUrl();
+  try {
+    history.replaceState(null, "", url);
+  } catch {
+    // ignore
+  }
+  const solved = facelets() === Cube.SOLVED;
+  try {
+    await navigator.clipboard.writeText(url);
+    setStatus(
+      solved
+        ? "Link copied. The cube is solved, so the link just opens the site. Scramble first to share a puzzle."
+        : "Link copied. Anyone who opens it gets this exact cube.",
+    );
+  } catch {
+    window.prompt("Copy this link:", url); // no clipboard access (old browser or not https)
+  }
+}
+
 // ----------------------------------------------------------------- solution tape
 function clearSolution() {
   state.solution = null;
@@ -338,7 +474,7 @@ function renderTape() {
 function updateControls() {
   const sol = state.solution;
   const busy = state.busy;
-  for (const id of ["solve", "scramble", "reset", "edit"]) $(id).disabled = busy;
+  for (const id of ["solve", "scramble", "reset", "edit", "share"]) $(id).disabled = busy;
   $("undo").disabled = busy || state.history.length === 0;
   $("redo").disabled = busy || state.future.length === 0;
   $("scramble-form").querySelector("button").disabled = busy;
@@ -451,6 +587,8 @@ function scramble() {
       await runSequence(Cube.parseMoves(r.scramble), Math.min(moveMs(), 70));
       if (facelets() !== r.facelets) setStickers(Cube.fromFacelets(r.facelets)); // safety net
       clearHistory();
+      lastScramble = { text: r.scramble, facelets: r.facelets };
+      scheduleHashSync();
       armPractice();
       setStatus(`Scrambled with ${r.length} moves. Solve it yourself, or press Solve.`);
     } catch (e) {
@@ -459,7 +597,7 @@ function scramble() {
   });
 }
 
-function applyScramble(text) {
+function applyScramble(text, doneMessage) {
   let moves;
   try {
     moves = Cube.parseMoves(text);
@@ -472,9 +610,13 @@ function applyScramble(text) {
     setStickers(Cube.fromFacelets(Cube.SOLVED));
     await runSequence(moves, Math.min(moveMs(), 90));
     clearHistory();
+    lastScramble = { text: moves.map(Cube.moveName).join(" "), facelets: facelets() };
+    scheduleHashSync();
     if (facelets() !== Cube.SOLVED) armPractice();
     else stopPractice();
-    setStatus(moves.length ? `Applied ${moves.length} moves. Press Solve.` : "Type some moves first, like R U R' U'.");
+    setStatus(
+      moves.length ? doneMessage || `Applied ${moves.length} moves. Press Solve.` : "Type some moves first, like R U R' U'.",
+    );
   });
 }
 
@@ -482,6 +624,7 @@ function reset() {
   if (state.busy) return;
   clearSolution();
   clearHistory();
+  lastScramble = null;
   stopPractice();
   document.querySelector(".practice").classList.remove("won");
   $("timer").textContent = formatTime(0);
@@ -587,6 +730,7 @@ function applyEditor() {
     return;
   }
   clearSolution();
+  lastScramble = null;
   setStickers(Cube.fromFacelets(editor.colors.join("")));
   clearHistory();
   if (facelets() !== Cube.SOLVED) armPractice();
@@ -605,6 +749,8 @@ $("scramble-form").addEventListener("submit", (e) => {
   e.preventDefault();
   applyScramble($("scramble-input").value);
 });
+$("share").addEventListener("click", copyLink);
+window.addEventListener("hashchange", loadFromHash); // a link pasted into this tab
 $("undo").addEventListener("click", undo);
 $("redo").addEventListener("click", redo);
 renderer.onSwipe = (move) => userTurn(move);
@@ -642,7 +788,8 @@ buildMovePad();
 setStickers(state.stickers);
 renderTape();
 renderPractice();
+loadFromHash();
 loadCounters();
 
-// Tell the person early if the server is not running.
-api("/api/health").catch((e) => setStatus(e.message, true));
+// Wake the server early (and say so if it takes a while).
+waitForServer().catch((e) => setStatus(e.message, true));
